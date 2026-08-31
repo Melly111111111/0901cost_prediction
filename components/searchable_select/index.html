@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --text-color: rgb(49, 51, 63);
+      --muted-color: rgb(104, 112, 118);
+      --border-color: rgb(204, 210, 219);
+      --focus-color: rgb(255, 75, 75);
+      --hover-bg: rgb(240, 242, 246);
+      --panel-bg: rgb(255, 255, 255);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text-color);
+      font-family: "Source Sans Pro", sans-serif;
+      font-size: 14px;
+    }
+
+    .select-wrap {
+      position: relative;
+      width: 100%;
+      padding-bottom: 0;
+    }
+
+    .select-label {
+      display: block;
+      margin-bottom: 0.3rem;
+      line-height: 1.25;
+      font-weight: 400;
+    }
+
+    .select-trigger {
+      display: flex;
+      width: 100%;
+      min-height: 2.35rem;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      border: 1px solid var(--border-color);
+      border-radius: 0.5rem;
+      background: var(--panel-bg);
+      color: var(--text-color);
+      padding: 0.42rem 0.72rem;
+      text-align: left;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .select-trigger:focus,
+    .select-trigger.open {
+      border-color: var(--focus-color);
+      box-shadow: 0 0 0 1px var(--focus-color);
+    }
+
+    .trigger-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      line-height: 1.4;
+    }
+
+    .chevron {
+      flex: 0 0 auto;
+      width: 0.55rem;
+      height: 0.55rem;
+      border-bottom: 2px solid var(--text-color);
+      border-right: 2px solid var(--text-color);
+      transform: rotate(45deg);
+      transition: transform 120ms ease;
+      margin-right: 0.1rem;
+    }
+
+    .select-trigger.open .chevron {
+      transform: rotate(225deg);
+      margin-top: 0.35rem;
+    }
+
+    .dropdown {
+      margin-top: 0.35rem;
+      width: 100%;
+      border: 1px solid var(--border-color);
+      border-radius: 0.5rem;
+      background: var(--panel-bg);
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+      overflow: hidden;
+    }
+
+    .search-box {
+      width: calc(100% - 1rem);
+      margin: 0.5rem;
+      border: 1px solid var(--border-color);
+      border-radius: 0.4rem;
+      padding: 0.45rem 0.55rem;
+      color: var(--text-color);
+      font: inherit;
+      outline: none;
+    }
+
+    .search-box:focus {
+      border-color: var(--focus-color);
+      box-shadow: 0 0 0 1px var(--focus-color);
+    }
+
+    .option-list {
+      max-height: 12rem;
+      overflow-y: auto;
+      padding: 0.25rem 0.5rem 0.5rem;
+    }
+
+    .option {
+      width: 100%;
+      border: 0;
+      border-radius: 0.35rem;
+      background: transparent;
+      color: var(--text-color);
+      padding: 0.5rem 0.55rem;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+      line-height: 1.45;
+    }
+
+    .option:hover,
+    .option.highlighted,
+    .option.selected {
+      background: var(--hover-bg);
+    }
+
+    .empty-state {
+      padding: 0.85rem 0.6rem 1rem;
+      color: var(--muted-color);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+    const root = document.getElementById("root");
+    let args = {
+      label: "",
+      options: [],
+      value: "",
+      placeholder: "Search",
+    };
+    let isOpen = false;
+    let searchText = "";
+    let highlightedIndex = 0;
+    let selectedValue = "";
+
+    function sendMessage(type, data = {}) {
+      window.parent.postMessage(
+        {
+          isStreamlitMessage: true,
+          type,
+          ...data,
+        },
+        "*"
+      );
+    }
+
+    function setFrameHeight() {
+      window.requestAnimationFrame(() => {
+        sendMessage("streamlit:setFrameHeight", {
+          height: document.documentElement.scrollHeight,
+        });
+      });
+    }
+
+    function setComponentValue(value) {
+      sendMessage("streamlit:setComponentValue", { value });
+    }
+
+    function normalize(value) {
+      return String(value || "").replace(/\s+/g, "").toLowerCase();
+    }
+
+    function filteredOptions() {
+      const terms = String(searchText || "")
+        .trim()
+        .split(/\s+/)
+        .map(normalize)
+        .filter(Boolean);
+
+      if (terms.length === 0) {
+        return args.options;
+      }
+
+      return args.options.filter((option) => {
+        const label = normalize(option.label);
+        return terms.every((term) => label.includes(term));
+      });
+    }
+
+    function selectedLabel() {
+      const selected = args.options.find(
+        (option) => String(option.value) === String(selectedValue)
+      );
+      return selected ? selected.label : "";
+    }
+
+    function closeDropdown() {
+      isOpen = false;
+      searchText = "";
+      highlightedIndex = 0;
+      render();
+    }
+
+    function choose(option) {
+      selectedValue = String(option.value);
+      isOpen = false;
+      searchText = "";
+      highlightedIndex = 0;
+      setComponentValue(selectedValue);
+      render();
+    }
+
+    function handleTriggerKeydown(event) {
+      if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+        event.preventDefault();
+        isOpen = true;
+        render();
+      }
+    }
+
+    function handleSearchKeydown(event, options) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDropdown();
+        return;
+      }
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        highlightedIndex = Math.min(highlightedIndex + 1, options.length - 1);
+        render();
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        highlightedIndex = Math.max(highlightedIndex - 1, 0);
+        render();
+        return;
+      }
+
+      if (event.key === "Enter" && options[highlightedIndex]) {
+        event.preventDefault();
+        choose(options[highlightedIndex]);
+      }
+    }
+
+    function render() {
+      const options = filteredOptions();
+      if (highlightedIndex >= options.length) {
+        highlightedIndex = Math.max(options.length - 1, 0);
+      }
+
+      root.innerHTML = "";
+
+      const wrap = document.createElement("div");
+      wrap.className = "select-wrap";
+
+      const label = document.createElement("label");
+      label.className = "select-label";
+      label.textContent = args.label || "";
+      wrap.appendChild(label);
+
+      const trigger = document.createElement("button");
+      trigger.type = "button";
+      trigger.className = `select-trigger${isOpen ? " open" : ""}`;
+      trigger.setAttribute("aria-expanded", String(isOpen));
+      trigger.addEventListener("click", (event) => {
+        event.stopPropagation();
+        isOpen = !isOpen;
+        render();
+      });
+      trigger.addEventListener("keydown", handleTriggerKeydown);
+
+      const text = document.createElement("span");
+      text.className = "trigger-text";
+      text.textContent = selectedLabel();
+      trigger.appendChild(text);
+
+      const chevron = document.createElement("span");
+      chevron.className = "chevron";
+      trigger.appendChild(chevron);
+      wrap.appendChild(trigger);
+
+      if (isOpen) {
+        const dropdown = document.createElement("div");
+        dropdown.className = "dropdown";
+
+        const search = document.createElement("input");
+        search.className = "search-box";
+        search.type = "search";
+        search.value = searchText;
+        search.placeholder = args.placeholder || "Search";
+        search.addEventListener("input", (event) => {
+          searchText = event.target.value;
+          highlightedIndex = 0;
+          render();
+        });
+        search.addEventListener("keydown", (event) => handleSearchKeydown(event, options));
+        dropdown.appendChild(search);
+
+        const list = document.createElement("div");
+        list.className = "option-list";
+
+        if (options.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "empty-state";
+          empty.textContent = "没有匹配项";
+          list.appendChild(empty);
+        } else {
+          options.forEach((option, index) => {
+            const item = document.createElement("button");
+            item.type = "button";
+            item.className = "option";
+            if (String(option.value) === String(selectedValue)) {
+              item.classList.add("selected");
+            }
+            if (index === highlightedIndex) {
+              item.classList.add("highlighted");
+            }
+            item.textContent = option.label;
+            item.addEventListener("mouseenter", () => {
+              highlightedIndex = index;
+            });
+            item.addEventListener("click", () => choose(option));
+            list.appendChild(item);
+          });
+        }
+
+        dropdown.appendChild(list);
+        wrap.appendChild(dropdown);
+
+        setTimeout(() => {
+          search.focus();
+          search.selectionStart = search.value.length;
+          search.selectionEnd = search.value.length;
+        }, 0);
+      }
+
+      root.appendChild(wrap);
+      setFrameHeight();
+    }
+
+    window.addEventListener("message", (event) => {
+      if (!event.data || event.data.type !== "streamlit:render") {
+        return;
+      }
+
+      args = {
+        label: event.data.args.label || "",
+        options: event.data.args.options || [],
+        value: event.data.args.value || "",
+        placeholder: event.data.args.placeholder || "Search",
+      };
+
+      if (!selectedValue || !args.options.some((option) => String(option.value) === String(selectedValue))) {
+        selectedValue = String(args.value || (args.options[0] && args.options[0].value) || "");
+      }
+
+      render();
+    });
+
+    document.addEventListener("click", (event) => {
+      if (isOpen && root && !root.contains(event.target)) {
+        closeDropdown();
+      }
+    });
+
+    sendMessage("streamlit:componentReady", { apiVersion: 1 });
+    setFrameHeight();
+  </script>
+</body>
+</html>
