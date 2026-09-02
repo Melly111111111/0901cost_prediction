@@ -2220,8 +2220,11 @@ if last:
             """,
             unsafe_allow_html=True,
         )
-        klass, text = prediction_judgment(predicted_cost, history_df[target_col])
-        st.markdown(f'<div class="judgment-box {klass}">{text}</div>', unsafe_allow_html=True)
+        klass, judgment_text = prediction_judgment(predicted_cost, history_df[target_col])
+        st.markdown(
+            f'<div class="judgment-box {klass}">{judgment_text}</div>',
+            unsafe_allow_html=True,
+        )
 
         st.markdown("#### 人工确认成本")
         with st.form("feedback_form", clear_on_submit=False):
