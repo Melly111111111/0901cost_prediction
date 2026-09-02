@@ -17,8 +17,14 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-with suppress(ImportError):
+try:
     from sqlalchemy import create_engine, text
+except ImportError as exc:
+    create_engine = None
+    text = None
+    SQLALCHEMY_IMPORT_ERROR = exc
+else:
+    SQLALCHEMY_IMPORT_ERROR = None
 
 from price_model_runtime import (
     STRICT_BUNDLE_FORMAT,
@@ -42,6 +48,22 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     with suppress(Exception):
         DATABASE_URL = str(st.secrets.get("DATABASE_URL", "")).strip()
+
+
+def normalize_database_url(database_url: str) -> str:
+    """Use psycopg 3 for standard PostgreSQL URLs on Streamlit Cloud."""
+    prefixes = (
+        ("postgresql+psycopg2://", "postgresql+psycopg://"),
+        ("postgresql://", "postgresql+psycopg://"),
+        ("postgres://", "postgresql+psycopg://"),
+    )
+    for source_prefix, target_prefix in prefixes:
+        if database_url.startswith(source_prefix):
+            return target_prefix + database_url[len(source_prefix) :]
+    return database_url
+
+
+DATABASE_URL = normalize_database_url(DATABASE_URL)
 QUOTE_PARAMETER_FILE = "产品配置数据.xlsx"
 RAW_HISTORY_FILE = "新建 Microsoft Excel 工作表.xlsx"
 MIDDLE_PRINT_COLOR_FEATURE = "中包装印刷色数"
@@ -333,11 +355,12 @@ def using_remote_database() -> bool:
 def remote_database_engine():
     if not DATABASE_URL:
         return None
-    if "create_engine" not in globals():
+    if create_engine is None or text is None:
         raise RuntimeError(
-            "已配置 DATABASE_URL，但运行环境缺少 SQLAlchemy。"
-            "请确认 requirements.txt 已包含数据库依赖。"
-        )
+            "已配置 DATABASE_URL，但 SQLAlchemy 导入失败。"
+            "请确认已上传最新 requirements.txt 并重新部署。"
+            f"原始错误：{SQLALCHEMY_IMPORT_ERROR}"
+        ) from SQLALCHEMY_IMPORT_ERROR
     return create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
@@ -345,8 +368,8 @@ def initialize_database() -> None:
     if using_remote_database():
         engine = remote_database_engine()
         with engine.begin() as conn:
-            conn.execute(text(PREDICTIONS_SCHEMA))
-            conn.execute(text(FEEDBACK_SCHEMA_POSTGRES))
+            conn.exec_driver_sql(PREDICTIONS_SCHEMA)
+            conn.exec_driver_sql(FEEDBACK_SCHEMA_POSTGRES)
         return
 
     with sqlite3.connect(DB_PATH) as conn:
