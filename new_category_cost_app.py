@@ -394,7 +394,8 @@ def read_database(sql: str, params: dict[str, object]) -> pd.DataFrame:
     initialize_database()
     if using_remote_database():
         with remote_database_engine().connect() as conn:
-            return pd.read_sql_query(text(sql), conn, params=params)
+            result = conn.execute(text(sql), params)
+            return pd.DataFrame(result.fetchall(), columns=result.keys())
 
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query(sql, conn, params=params)
