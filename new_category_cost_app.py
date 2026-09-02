@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import uuid
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
+
+with suppress(ImportError):
+    from sqlalchemy import create_engine, text
 
 from price_model_runtime import (
     STRICT_BUNDLE_FORMAT,
@@ -34,12 +38,23 @@ SEARCHABLE_SELECT_COMPONENT = components.declare_component(
 NEW_CATEGORY_BUNDLE_FORMAT = "new_category_experiment_v1"
 MODEL_PATH = APP_DIR / "new_category_cost_model.joblib"
 DB_PATH = APP_DIR / "new_category_cost_feedback.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    with suppress(Exception):
+        DATABASE_URL = str(st.secrets.get("DATABASE_URL", "")).strip()
 QUOTE_PARAMETER_FILE = "产品配置数据.xlsx"
 RAW_HISTORY_FILE = "新建 Microsoft Excel 工作表.xlsx"
 MIDDLE_PRINT_COLOR_FEATURE = "中包装印刷色数"
 MIDDLE_PRINT_COLOR_LEVELS = np.arange(5, dtype=float)
 # Training-data-derived cumulative print increments per allocation unit.
 MIDDLE_PRINT_INCREMENT_PER_ALLOCATION_UNIT = np.array(
+    [0.0, 0.0572439785, 0.0784875901, 0.1087624229, 0.1164446875],
+    dtype=float,
+)
+OUTER_PRINT_COLOR_FEATURE = "外包装印刷色数"
+OUTER_PRINT_COLOR_LEVELS = np.arange(5, dtype=float)
+# Use the same cumulative print-cost basis as middle packaging, allocated per PCS.
+OUTER_PRINT_INCREMENT_PER_ALLOCATION_UNIT = np.array(
     [0.0, 0.0572439785, 0.0784875901, 0.1087624229, 0.1164446875],
     dtype=float,
 )
@@ -276,42 +291,90 @@ PAGE_CSS = """
 """
 
 
-def connect_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS predictions (
-            id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            input_json TEXT NOT NULL,
-            derived_json TEXT NOT NULL,
-            prediction REAL NOT NULL,
-            log_prediction REAL NOT NULL,
-            avg_cost REAL,
-            median_cost REAL,
-            source TEXT NOT NULL
+PREDICTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS predictions (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    derived_json TEXT NOT NULL,
+    prediction REAL NOT NULL,
+    log_prediction REAL NOT NULL,
+    avg_cost REAL,
+    median_cost REAL,
+    source TEXT NOT NULL
+)
+"""
+FEEDBACK_SCHEMA_SQLITE = """
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    predicted_cost REAL NOT NULL,
+    actual_cost REAL NOT NULL,
+    error REAL NOT NULL,
+    error_rate REAL NOT NULL,
+    reviewer TEXT,
+    note TEXT,
+    input_json TEXT NOT NULL,
+    FOREIGN KEY(prediction_id) REFERENCES predictions(id)
+)
+"""
+FEEDBACK_SCHEMA_POSTGRES = FEEDBACK_SCHEMA_SQLITE.replace(
+    "id INTEGER PRIMARY KEY AUTOINCREMENT",
+    "id BIGSERIAL PRIMARY KEY",
+)
+
+
+def using_remote_database() -> bool:
+    return bool(DATABASE_URL)
+
+
+@st.cache_resource
+def remote_database_engine():
+    if not DATABASE_URL:
+        return None
+    if "create_engine" not in globals():
+        raise RuntimeError(
+            "已配置 DATABASE_URL，但运行环境缺少 SQLAlchemy。"
+            "请确认 requirements.txt 已包含数据库依赖。"
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            prediction_id TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            predicted_cost REAL NOT NULL,
-            actual_cost REAL NOT NULL,
-            error REAL NOT NULL,
-            error_rate REAL NOT NULL,
-            reviewer TEXT,
-            note TEXT,
-            input_json TEXT NOT NULL,
-            FOREIGN KEY(prediction_id) REFERENCES predictions(id)
-        )
-        """
-    )
-    conn.commit()
-    return conn
+    return create_engine(DATABASE_URL, pool_pre_ping=True)
+
+
+def initialize_database() -> None:
+    if using_remote_database():
+        engine = remote_database_engine()
+        with engine.begin() as conn:
+            conn.execute(text(PREDICTIONS_SCHEMA))
+            conn.execute(text(FEEDBACK_SCHEMA_POSTGRES))
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(PREDICTIONS_SCHEMA)
+        conn.execute(FEEDBACK_SCHEMA_SQLITE)
+        conn.commit()
+
+
+def execute_database(sql: str, params: dict[str, object]) -> None:
+    initialize_database()
+    if using_remote_database():
+        with remote_database_engine().begin() as conn:
+            conn.execute(text(sql), params)
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(sql, params)
+        conn.commit()
+
+
+def read_database(sql: str, params: dict[str, object]) -> pd.DataFrame:
+    initialize_database()
+    if using_remote_database():
+        with remote_database_engine().connect() as conn:
+            return pd.read_sql_query(text(sql), conn, params=params)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query(sql, conn, params=params)
 
 
 def save_prediction(
@@ -324,26 +387,26 @@ def save_prediction(
     source: str,
 ) -> str:
     prediction_id = str(uuid.uuid4())
-    with connect_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO predictions
-            (id, created_at, input_json, derived_json, prediction, log_prediction, avg_cost, median_cost, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                prediction_id,
-                datetime.now().isoformat(timespec="seconds"),
-                json.dumps(input_data, ensure_ascii=False),
-                json.dumps(derived_data, ensure_ascii=False),
-                prediction,
-                log_prediction,
-                avg_cost,
-                median_cost,
-                source,
-            ),
-        )
-        conn.commit()
+    execute_database(
+        """
+        INSERT INTO predictions
+        (id, created_at, input_json, derived_json, prediction, log_prediction,
+         avg_cost, median_cost, source)
+        VALUES (:id, :created_at, :input_json, :derived_json, :prediction,
+                :log_prediction, :avg_cost, :median_cost, :source)
+        """,
+        {
+            "id": prediction_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "input_json": json.dumps(input_data, ensure_ascii=False),
+            "derived_json": json.dumps(derived_data, ensure_ascii=False),
+            "prediction": prediction,
+            "log_prediction": log_prediction,
+            "avg_cost": avg_cost,
+            "median_cost": median_cost,
+            "source": source,
+        },
+    )
     return prediction_id
 
 
@@ -357,47 +420,45 @@ def save_feedback(
 ) -> None:
     error = actual_cost - predicted_cost
     error_rate = error / max(abs(actual_cost), 1e-12)
-    with connect_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO feedback
-            (prediction_id, created_at, predicted_cost, actual_cost, error, error_rate, reviewer, note, input_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                prediction_id,
-                datetime.now().isoformat(timespec="seconds"),
-                predicted_cost,
-                actual_cost,
-                error,
-                error_rate,
-                reviewer,
-                note,
-                json.dumps(input_data, ensure_ascii=False),
-            ),
-        )
-        conn.commit()
+    execute_database(
+        """
+        INSERT INTO feedback
+        (prediction_id, created_at, predicted_cost, actual_cost, error, error_rate,
+         reviewer, note, input_json)
+        VALUES (:prediction_id, :created_at, :predicted_cost, :actual_cost,
+                :error, :error_rate, :reviewer, :note, :input_json)
+        """,
+        {
+            "prediction_id": prediction_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "predicted_cost": predicted_cost,
+            "actual_cost": actual_cost,
+            "error": error,
+            "error_rate": error_rate,
+            "reviewer": reviewer,
+            "note": note,
+            "input_json": json.dumps(input_data, ensure_ascii=False),
+        },
+    )
 
 
 def read_feedback(limit: int = 200) -> pd.DataFrame:
-    with connect_db() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT created_at AS 录入时间,
-                   prediction_id AS 预测ID,
-                   predicted_cost AS 预测成本,
-                   actual_cost AS 人工确认成本,
-                   error AS 误差,
-                   error_rate AS 误差率,
-                   reviewer AS 确认人,
-                   note AS 备注
-            FROM feedback
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            conn,
-            params=(limit,),
-        )
+    return read_database(
+        """
+        SELECT created_at AS 录入时间,
+               prediction_id AS 预测ID,
+               predicted_cost AS 预测成本,
+               actual_cost AS 人工确认成本,
+               error AS 误差,
+               error_rate AS 误差率,
+               reviewer AS 确认人,
+               note AS 备注
+        FROM feedback
+        ORDER BY id DESC
+        LIMIT :limit
+        """,
+        {"limit": limit},
+    )
 
 
 def parse_json_dict(value: object) -> dict[str, object]:
@@ -430,23 +491,21 @@ def expand_prediction_inputs(records: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_predictions(limit: int = 200) -> pd.DataFrame:
-    with connect_db() as conn:
-        records = pd.read_sql_query(
-            """
-            SELECT created_at AS 预测时间,
-                   id AS 预测ID,
-                   input_json,
-                   prediction AS 预测成本,
-                   avg_cost AS 历史均值,
-                   median_cost AS 历史中位数,
-                   source AS 来源
-            FROM predictions
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            conn,
-            params=(limit,),
-        )
+    records = read_database(
+        """
+        SELECT created_at AS 预测时间,
+               id AS 预测ID,
+               input_json,
+               prediction AS 预测成本,
+               avg_cost AS 历史均值,
+               median_cost AS 历史中位数,
+               source AS 来源
+        FROM predictions
+        ORDER BY created_at DESC
+        LIMIT :limit
+        """,
+        {"limit": limit},
+    )
     return expand_prediction_inputs(records)
 
 
@@ -1377,6 +1436,48 @@ def _apply_middle_color_increment(
     return constrained
 
 
+def _apply_outer_color_increment(
+    bundle: dict[str, object],
+    input_df: pd.DataFrame,
+    raw_prediction: np.ndarray,
+) -> np.ndarray:
+    """Use the 0-color model output as the base and add a strict outer-color increment."""
+    original_columns = list(bundle["original_feature_columns"])
+    if (
+        len(input_df) == 0
+        or OUTER_PRINT_COLOR_FEATURE not in original_columns
+        or "外包装成本分摊系数" not in original_columns
+    ):
+        return np.asarray(raw_prediction, dtype=float)
+
+    original = input_df[original_columns].astype(float).reset_index(drop=True)
+    constrained = np.asarray(raw_prediction, dtype=float).copy()
+    for row_index in range(len(original)):
+        current_color = float(original.loc[row_index, OUTER_PRINT_COLOR_FEATURE])
+        level_index = int(np.argmin(np.abs(OUTER_PRINT_COLOR_LEVELS - current_color)))
+        if not np.isclose(current_color, OUTER_PRINT_COLOR_LEVELS[level_index]):
+            continue
+
+        allocation_factor = float(original.loc[row_index, "外包装成本分摊系数"])
+        if not np.isfinite(allocation_factor) or allocation_factor <= 0:
+            continue
+
+        base_scenario = original.iloc[[row_index]].copy().reset_index(drop=True)
+        base_scenario.loc[0, OUTER_PRINT_COLOR_FEATURE] = 0.0
+        base_prediction, _ = _predict_new_category_model_raw(bundle, base_scenario)
+        base_prediction = _apply_middle_color_increment(
+            bundle,
+            base_scenario,
+            base_prediction,
+        )
+        constrained[row_index] = (
+            float(base_prediction[0])
+            + allocation_factor * OUTER_PRINT_INCREMENT_PER_ALLOCATION_UNIT[level_index]
+        )
+
+    return constrained
+
+
 def predict_new_category_model(
     bundle: dict[str, object],
     input_df: pd.DataFrame,
@@ -1386,6 +1487,7 @@ def predict_new_category_model(
         input_df,
     )
     prediction = _apply_middle_color_increment(bundle, input_df, raw_prediction)
+    prediction = _apply_outer_color_increment(bundle, input_df, prediction)
     return prediction, component_predictions
 
 
@@ -1415,7 +1517,7 @@ def new_category_local_sensitivity(
     records: list[dict[str, object]] = []
     for feature in original_columns:
         value = float(base_frame.iloc[0][feature])
-        if feature == MIDDLE_PRINT_COLOR_FEATURE:
+        if feature in {MIDDLE_PRINT_COLOR_FEATURE, OUTER_PRINT_COLOR_FEATURE}:
             current_level = int(np.clip(round(value), 0, 4))
             candidates = [
                 float(level)
@@ -2041,9 +2143,16 @@ if predict_clicked:
     )
     if not history_match.empty:
         predicted_cost = float(history_match[target_col].iloc[0])
+        predicted_cost = float(
+            _apply_outer_color_increment(
+                bundle,
+                input_df,
+                np.asarray([predicted_cost], dtype=float),
+            )[0]
+        )
         log_prediction = float(np.log(predicted_cost))
-        source = "历史完全匹配"
-        st.success("匹配到历史完全一致记录，本次结果直接采用历史实际成本。")
+        source = "历史完全匹配（已做外箱印刷单调校正）"
+        st.success("匹配到历史完全一致记录，本次结果已按外箱印刷色数递增规则校正。")
     else:
         predicted_cost, log_prediction = predict_huber(bundle, input_df)
         source = "AI模型预测"
