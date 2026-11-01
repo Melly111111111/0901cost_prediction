@@ -5,7 +5,6 @@ import os
 import re
 import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from contextlib import suppress
 from pathlib import Path
 
 import joblib
@@ -19,9 +18,11 @@ from cost_database import CostDatabase
 
 try:
     from sqlalchemy import create_engine, text
+    from sqlalchemy.exc import SQLAlchemyError
 except ImportError as exc:
     create_engine = None
     text = None
+    SQLAlchemyError = Exception
     SQLALCHEMY_IMPORT_ERROR = exc
 else:
     SQLALCHEMY_IMPORT_ERROR = None
@@ -44,10 +45,9 @@ SEARCHABLE_SELECT_COMPONENT = components.declare_component(
 NEW_CATEGORY_BUNDLE_FORMAT = "new_category_experiment_v1"
 MODEL_PATH = APP_DIR / "new_category_cost_model.joblib"
 DB_PATH = APP_DIR / "new_category_cost_feedback.db"
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    with suppress(Exception):
-        DATABASE_URL = str(st.secrets.get("DATABASE_URL", "")).strip()
+# Use the bundled SQLite database.  PostgreSQL can be re-enabled later by
+# restoring the DATABASE_URL lookup and configuring Streamlit Secrets.
+DATABASE_URL = ""
 
 
 def normalize_database_url(database_url: str) -> str:
@@ -2107,15 +2107,24 @@ if predict_clicked and model_available:
         predicted_cost, log_prediction = predict_huber(bundle, input_df)
         source = "AI模型预测"
 
-    prediction_id = save_prediction(
-        input_payload,
-        derived_payload,
-        predicted_cost,
-        log_prediction,
-        avg_cost,
-        median_cost,
-        source,
-    )
+    try:
+        prediction_id = save_prediction(
+            input_payload,
+            derived_payload,
+            predicted_cost,
+            log_prediction,
+            avg_cost,
+            median_cost,
+            source,
+        )
+    except SQLAlchemyError as exc:
+        st.error(
+            "预测已完成，但保存记录失败。请检查 Streamlit Secrets 中的 "
+            "DATABASE_URL、数据库是否允许外网连接，以及用户名和密码是否正确。"
+        )
+        with st.expander("查看数据库错误详情"):
+            st.code(f"{type(exc).__name__}: {exc}")
+        st.stop()
     analysis = coefficient_analysis(bundle, input_df)
     st.session_state.last_prediction = {
         "prediction_id": prediction_id,
