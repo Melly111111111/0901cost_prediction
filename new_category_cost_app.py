@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
-import uuid
+import hashlib
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from contextlib import suppress
-from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -16,6 +15,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
+from cost_database import CostDatabase
 
 try:
     from sqlalchemy import create_engine, text
@@ -51,7 +51,8 @@ if not DATABASE_URL:
 
 
 def normalize_database_url(database_url: str) -> str:
-    """Use psycopg 3 for standard PostgreSQL URLs on Streamlit Cloud."""
+    """Normalize cloud PostgreSQL URLs for psycopg 3 and TLS connections."""
+    database_url = database_url.strip()
     prefixes = (
         ("postgresql+psycopg2://", "postgresql+psycopg://"),
         ("postgresql://", "postgresql+psycopg://"),
@@ -59,7 +60,16 @@ def normalize_database_url(database_url: str) -> str:
     )
     for source_prefix, target_prefix in prefixes:
         if database_url.startswith(source_prefix):
-            return target_prefix + database_url[len(source_prefix) :]
+            database_url = target_prefix + database_url[len(source_prefix) :]
+            break
+
+    # Managed PostgreSQL services require TLS.  Do not override an explicit
+    # setting, since local/self-hosted PostgreSQL may intentionally disable it.
+    if database_url.startswith("postgresql+"):
+        parsed = urlsplit(database_url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query.setdefault("sslmode", "require")
+        database_url = urlunsplit(parsed._replace(query=urlencode(query)))
     return database_url
 
 
@@ -313,40 +323,6 @@ PAGE_CSS = """
 """
 
 
-PREDICTIONS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS predictions (
-    id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    input_json TEXT NOT NULL,
-    derived_json TEXT NOT NULL,
-    prediction REAL NOT NULL,
-    log_prediction REAL NOT NULL,
-    avg_cost REAL,
-    median_cost REAL,
-    source TEXT NOT NULL
-)
-"""
-FEEDBACK_SCHEMA_SQLITE = """
-CREATE TABLE IF NOT EXISTS feedback (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    prediction_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    predicted_cost REAL NOT NULL,
-    actual_cost REAL NOT NULL,
-    error REAL NOT NULL,
-    error_rate REAL NOT NULL,
-    reviewer TEXT,
-    note TEXT,
-    input_json TEXT NOT NULL,
-    FOREIGN KEY(prediction_id) REFERENCES predictions(id)
-)
-"""
-FEEDBACK_SCHEMA_POSTGRES = FEEDBACK_SCHEMA_SQLITE.replace(
-    "id INTEGER PRIMARY KEY AUTOINCREMENT",
-    "id BIGSERIAL PRIMARY KEY",
-)
-
-
 def using_remote_database() -> bool:
     return bool(DATABASE_URL)
 
@@ -361,44 +337,31 @@ def remote_database_engine():
             "请确认已上传最新 requirements.txt 并重新部署。"
             f"原始错误：{SQLALCHEMY_IMPORT_ERROR}"
         ) from SQLALCHEMY_IMPORT_ERROR
-    return create_engine(DATABASE_URL, pool_pre_ping=True)
+    return create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 15},
+    )
 
 
 def initialize_database() -> None:
-    if using_remote_database():
-        engine = remote_database_engine()
-        with engine.begin() as conn:
-            conn.exec_driver_sql(PREDICTIONS_SCHEMA)
-            conn.exec_driver_sql(FEEDBACK_SCHEMA_POSTGRES)
-        return
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(PREDICTIONS_SCHEMA)
-        conn.execute(FEEDBACK_SCHEMA_SQLITE)
-        conn.commit()
+    cost_database().initialize()
 
 
-def execute_database(sql: str, params: dict[str, object]) -> None:
-    initialize_database()
-    if using_remote_database():
-        with remote_database_engine().begin() as conn:
-            conn.execute(text(sql), params)
-        return
+@st.cache_resource
+def cost_database():
+    return CostDatabase(DB_PATH, remote_database_engine() if using_remote_database() else None)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(sql, params)
-        conn.commit()
+
+@st.cache_data
+def model_database_metadata(path: str, modified_ns: int, feature_version: str):
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return {"id": digest, "name": Path(path).name,
+            "file_sha256": digest, "feature_version": feature_version}
 
 
 def read_database(sql: str, params: dict[str, object]) -> pd.DataFrame:
-    initialize_database()
-    if using_remote_database():
-        with remote_database_engine().connect() as conn:
-            result = conn.execute(text(sql), params)
-            return pd.DataFrame(result.fetchall(), columns=result.keys())
-
-    with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    return cost_database().read(sql, params)
 
 
 def save_prediction(
@@ -410,28 +373,13 @@ def save_prediction(
     median_cost: float,
     source: str,
 ) -> str:
-    prediction_id = str(uuid.uuid4())
-    execute_database(
-        """
-        INSERT INTO predictions
-        (id, created_at, input_json, derived_json, prediction, log_prediction,
-         avg_cost, median_cost, source)
-        VALUES (:id, :created_at, :input_json, :derived_json, :prediction,
-                :log_prediction, :avg_cost, :median_cost, :source)
-        """,
-        {
-            "id": prediction_id,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "input_json": json.dumps(input_data, ensure_ascii=False),
-            "derived_json": json.dumps(derived_data, ensure_ascii=False),
-            "prediction": prediction,
-            "log_prediction": log_prediction,
-            "avg_cost": avg_cost,
-            "median_cost": median_cost,
-            "source": source,
-        },
+    path = Path(bundle["_model_path"])
+    model = model_database_metadata(str(path), path.stat().st_mtime_ns,
+                                    str(bundle.get("bundle_format", "legacy")))
+    return cost_database().save_prediction(
+        input_data, derived_data, prediction, log_prediction, avg_cost,
+        median_cost, source, model,
     )
-    return prediction_id
 
 
 def save_feedback(
@@ -442,28 +390,7 @@ def save_feedback(
     note: str,
     input_data: dict[str, object],
 ) -> None:
-    error = actual_cost - predicted_cost
-    error_rate = error / max(abs(actual_cost), 1e-12)
-    execute_database(
-        """
-        INSERT INTO feedback
-        (prediction_id, created_at, predicted_cost, actual_cost, error, error_rate,
-         reviewer, note, input_json)
-        VALUES (:prediction_id, :created_at, :predicted_cost, :actual_cost,
-                :error, :error_rate, :reviewer, :note, :input_json)
-        """,
-        {
-            "prediction_id": prediction_id,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "predicted_cost": predicted_cost,
-            "actual_cost": actual_cost,
-            "error": error,
-            "error_rate": error_rate,
-            "reviewer": reviewer,
-            "note": note,
-            "input_json": json.dumps(input_data, ensure_ascii=False),
-        },
-    )
+    cost_database().save_feedback(prediction_id, actual_cost, reviewer, note)
 
 
 def read_feedback(limit: int = 200) -> pd.DataFrame:
@@ -477,8 +404,8 @@ def read_feedback(limit: int = 200) -> pd.DataFrame:
                error_rate AS 误差率,
                reviewer AS 确认人,
                note AS 备注
-        FROM feedback
-        ORDER BY id DESC
+        FROM feedback_details
+        ORDER BY created_at DESC, id DESC
         LIMIT :limit
         """,
         {"limit": limit},
@@ -515,21 +442,7 @@ def expand_prediction_inputs(records: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_predictions(limit: int = 200) -> pd.DataFrame:
-    records = read_database(
-        """
-        SELECT created_at AS 预测时间,
-               id AS 预测ID,
-               input_json,
-               prediction AS 预测成本,
-               avg_cost AS 历史均值,
-               median_cost AS 历史中位数,
-               source AS 来源
-        FROM predictions
-        ORDER BY created_at DESC
-        LIMIT :limit
-        """,
-        {"limit": limit},
-    )
+    records = cost_database().prediction_records(limit)
     return expand_prediction_inputs(records)
 
 
@@ -1950,6 +1863,18 @@ sterilization_options = list(
 st.title("无纺布产品成本智能预测系统")
 st.info("本系统对生产工艺参数进行预测，可以自动识别非线性关系并剔除无关干扰因素。")
 
+selected_model = st.selectbox(
+    "预测模型",
+    ["SVM+XGBoost", "模型2", "模型3", "模型4", "模型5"],
+    key="prediction_model",
+)
+model_available = selected_model == "SVM+XGBoost"
+if st.session_state.get("previous_prediction_model") != selected_model:
+    st.session_state.last_prediction = None
+    st.session_state.previous_prediction_model = selected_model
+if not model_available:
+    st.warning(f"{selected_model}暂未接入，当前无法进行预测。")
+
 if product_options.empty or package_options.empty:
     st.error(f"未能从 {QUOTE_PARAMETER_FILE} 读取产品或包装组合选项，请确认文件和工作表名称。")
     st.stop()
@@ -2116,6 +2041,7 @@ with st.container(border=True):
 predict_clicked = st.button(
     "开始预测",
     type="primary",
+    disabled=not model_available,
 )
 
 low_sample_reasons: list[str] = []
@@ -2150,7 +2076,7 @@ input_payload = {
 if "last_prediction" not in st.session_state:
     st.session_state.last_prediction = None
 
-if predict_clicked:
+if predict_clicked and model_available:
     input_df, derived_payload = build_input_row(input_payload, bundle)
     model_feature_columns = (
         list(bundle["original_feature_columns"])
